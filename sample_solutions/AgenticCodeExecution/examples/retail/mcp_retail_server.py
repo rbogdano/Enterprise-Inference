@@ -6,9 +6,13 @@ All business logic is directly in the MCP tools - no intermediate wrapper classe
 """
 
 import argparse
+import ast
 import json
+import operator
 import os
 import sys
+import threading
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -54,7 +58,7 @@ def ensure_db(db_path: str) -> None:
     print(f"   Downloading from tau2-bench …")
     p.parent.mkdir(parents=True, exist_ok=True)
     try:
-        urllib.request.urlretrieve(TAU2_BENCH_URL, str(p))
+        urllib.request.urlretrieve(TAU2_BENCH_URL, str(p))  # nosec B310 - hardcoded https URL to tau2-bench dataset
         print(f"   ✅ Downloaded ({p.stat().st_size / 1_048_576:.1f} MB)")
     except Exception as exc:
         print(f"   ❌ Download failed: {exc}")
@@ -83,8 +87,14 @@ modifying orders or processing returns/exchanges."""
 _db: Optional[RetailDB] = None  # Read-only template DB
 _original_db_path: str = ""  # Path to the original pristine DB file
 _session_dbs: Dict[str, RetailDB] = {}  # Per-session DB copies
+_session_last_access: Dict[str, float] = {}  # session_id -> monotonic last-access timestamp
+_session_lock = threading.Lock()
 SESSION_DB_DIR = Path(__file__).resolve().parent.parent / "session_dbs"
 SESSION_DB_DIR.mkdir(exist_ok=True)
+
+# Idle session eviction: 30-minute lifetime, sweep every 60s
+SESSION_TTL_SECONDS = 30 * 60
+SESSION_SWEEP_INTERVAL_SECONDS = 60
 
 
 def _normalize_order_id(order_id: str) -> str:
@@ -126,16 +136,59 @@ def get_db(session_id: str = "") -> RetailDB:
     if not session_id:
         return _db
 
-    if session_id not in _session_dbs:
-        # Load fresh pristine copy from the original file
-        db = RetailDB.load(_original_db_path)
-        session_db_file = _session_db_file(session_id)
-        db._db_path = str(session_db_file)
-        _session_dbs[session_id] = db
-        print(f"🆕 Created pristine DB for session {session_id[:8]}... "
-              f"({len(_session_dbs)} active sessions)")
+    with _session_lock:
+        if session_id not in _session_dbs:
+            # Load fresh pristine copy from the original file
+            db = RetailDB.load(_original_db_path)
+            session_db_file = _session_db_file(session_id)
+            db._db_path = str(session_db_file)
+            _session_dbs[session_id] = db
+            print(f"🆕 Created pristine DB for session {session_id[:8]}... "
+                  f"({len(_session_dbs)} active sessions)")
+        _session_last_access[session_id] = time.monotonic()
+        return _session_dbs[session_id]
 
-    return _session_dbs[session_id]
+
+def _evict_session(session_id: str) -> None:
+    """Remove a session's in-memory DB and its on-disk JSON file. Caller holds _session_lock."""
+    _session_dbs.pop(session_id, None)
+    _session_last_access.pop(session_id, None)
+    try:
+        _session_db_file(session_id).unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"⚠️  Failed to remove session file for {session_id[:8]}...: {exc}")
+
+
+def _sweep_idle_sessions() -> None:
+    """Evict any session whose last access is older than SESSION_TTL_SECONDS."""
+    now = time.monotonic()
+    with _session_lock:
+        expired = [
+            sid for sid, last in _session_last_access.items()
+            if now - last > SESSION_TTL_SECONDS
+        ]
+        for sid in expired:
+            _evict_session(sid)
+    if expired:
+        print(f"🧹 Evicted {len(expired)} idle session(s) "
+              f"(>{SESSION_TTL_SECONDS // 60}min); {len(_session_dbs)} remaining")
+
+
+def _session_sweeper_loop() -> None:
+    while True:
+        time.sleep(SESSION_SWEEP_INTERVAL_SECONDS)
+        try:
+            _sweep_idle_sessions()
+        except Exception as exc:
+            print(f"⚠️  Session sweeper error: {exc}")
+
+
+def start_session_sweeper() -> None:
+    """Start the background thread that evicts idle sessions."""
+    t = threading.Thread(target=_session_sweeper_loop, name="session-sweeper", daemon=True)
+    t.start()
+    print(f"🧹 Session sweeper started (TTL={SESSION_TTL_SECONDS // 60}min, "
+          f"interval={SESSION_SWEEP_INTERVAL_SECONDS}s)")
 
 
 def _get_data_model_defs() -> Dict[str, dict]:
@@ -463,19 +516,43 @@ def list_all_product_types(session_id: str = "") -> str:
 
 # ==================== UTILITY TOOLS ====================
 
+_CALC_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _safe_eval_math(node: ast.AST) -> float:
+    if isinstance(node, ast.Expression):
+        return _safe_eval_math(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _CALC_OPS:
+        return _CALC_OPS[type(node.op)](_safe_eval_math(node.left), _safe_eval_math(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _CALC_OPS:
+        return _CALC_OPS[type(node.op)](_safe_eval_math(node.operand))
+    raise ValueError("Unsupported expression")
+
+
 @mcp.tool()
 def calculate(expression: str, session_id: str = "") -> str:
     """Calculate the result of a mathematical expression.
-    
+
     Args:
         expression: The mathematical expression, such as '2 + 2' or '100 * 0.1'.
-        
+
     Returns:
         The calculated result as a string.
     """
-    if not all(char in "0123456789+-*/(). " for char in expression):
-        raise ValueError("Invalid characters in expression")
-    return str(round(float(eval(expression, {"__builtins__": None}, {})), 2))
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as e:
+        raise ValueError("Invalid expression") from e
+    return str(round(float(_safe_eval_math(tree)), 2))
 
 
 @mcp.tool()
@@ -1004,6 +1081,9 @@ if __name__ == "__main__":
     get_db()
     print(f"   Original DB file is READ-ONLY (per-session copies used for mutations)")
     print(f"   Session DB dir: {SESSION_DB_DIR}")
+
+    # Start background eviction of idle sessions
+    start_session_sweeper()
     
     print(f"\n🚀 Starting Retail MCP Server...")
     print(f"   Transport: {args.transport}")
